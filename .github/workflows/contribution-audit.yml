@@ -1,0 +1,63 @@
+name: Fork-only contribution audit
+
+on:
+  push:
+    branches: [audit/pgbot-quality-20260922]
+    paths: [.github/workflows/contribution-audit.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-contribution-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    if: github.repository == 'DivyamTalwar/pgbot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the pinned upstream baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a1e6561e366455756c45a16a46647f882b3b6a1c
+          persist-credentials: false
+      - name: Archive source without credentials or git configuration
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/pgbot-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/pgbot-source-commit.txt"
+      - name: Publish the baseline source for offline review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pgbot-baseline-source
+          path: |
+            ${{ runner.temp }}/pgbot-source.tar.gz
+            ${{ runner.temp }}/pgbot-source-commit.txt
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Install the upstream-pinned linter
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      - name: Run the committed-HEAD gate without changing upstream
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pgbot-audit-logs"
+          go version | tee "$RUNNER_TEMP/pgbot-audit-logs/toolchain.txt"
+          scripts/gate.sh 2>&1 | tee "$RUNNER_TEMP/pgbot-audit-logs/gate.txt"
+      - name: Run the race-enabled unit suite
+        run: |
+          set -euo pipefail
+          go test -race ./... 2>&1 | tee "$RUNNER_TEMP/pgbot-audit-logs/race.txt"
+      - name: Preserve test evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pgbot-baseline-test-evidence
+          path: ${{ runner.temp }}/pgbot-audit-logs/
+          retention-days: 7
+          if-no-files-found: warn
