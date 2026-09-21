@@ -1,0 +1,198 @@
+name: Validate contribution candidates
+
+on:
+  push:
+    branches: [audit/pgbot-quality-20260922]
+    paths:
+      - .github/workflows/validate-contribution-candidates.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-contribution-candidates
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    if: github.repository == 'DivyamTalwar/pgbot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: mcp-write-errors
+            package: mcp
+            test_file: internal/mcp/transport_test.go
+            source_file: internal/mcp/mcp.go
+            docs_file: unused-doc-path
+            test_pattern: 'TestServe_(returnsWriteErrorAndStopsDispatch|finalResponseWriteErrorWinsOverEOF)$'
+            required_failures: 'TestServe_returnsWriteErrorAndStopsDispatch,TestServe_finalResponseWriteErrorWinsOverEOF'
+            tree: cb1a927cd81ea82631dffd82d3b05f754344237a
+            message: 'fix(mcp): stop serving after response transport failures'
+          - slug: ssh-handshake-cancel
+            package: conn
+            test_file: internal/conn/sshtunnel_cancel_test.go
+            source_file: internal/conn/sshtunnel.go
+            docs_file: unused-doc-path
+            test_pattern: 'Test(DialSSH_cancelStalledHandshake|SSHTunnel_completedHandshakeOutlivesDialContext)$'
+            required_failures: TestDialSSH_cancelStalledHandshake
+            tree: 89423fb484f827fd6cc14b438999d920e093e572
+            message: 'fix(conn): cancel stalled SSH handshakes'
+          - slug: replica-critical-threshold
+            package: findings
+            test_file: internal/findings/replica_lag_threshold_test.go
+            source_file: internal/findings/findings.go
+            docs_file: docs/findings/replica_lag_time.md
+            test_pattern: 'TestReplicaLagTime_(warningThresholdCannotHideCritical|highWarning)'
+            required_failures: 'TestReplicaLagTime_warningThresholdCannotHideCritical,TestReplicaLagTime_highWarningReportsWorstCriticalReplica'
+            tree: afec2b929b5679038320bfb514b2f66b5eab53b6
+            message: 'fix(findings): preserve the fixed critical replica lag threshold'
+    env:
+      BASE: a1e6561e366455756c45a16a46647f882b3b6a1c
+      SLUG: ${{ matrix.slug }}
+      PACKAGE: ${{ matrix.package }}
+      TEST_FILE: ${{ matrix.test_file }}
+      SOURCE_FILE: ${{ matrix.source_file }}
+      DOCS_FILE: ${{ matrix.docs_file }}
+      TEST_PATTERN: ${{ matrix.test_pattern }}
+      REQUIRED_FAILURES: ${{ matrix.required_failures }}
+      EXPECTED_TREE: ${{ matrix.tree }}
+      COMMIT_MESSAGE: ${{ matrix.message }}
+      GOTOOLCHAIN: local
+    steps:
+      - name: Read the reviewed audit inputs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: audit-inputs
+          persist-credentials: false
+      - name: Check out the exact upstream baseline, with real history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a1e6561e366455756c45a16a46647f882b3b6a1c
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: candidate/go.mod
+          cache-dependency-path: candidate/go.sum
+      - name: Install validation tools
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          { go version; golangci-lint version; go version -m "$(go env GOPATH)/bin/govulncheck"; } > "$RUNNER_TEMP/evidence/tools.txt"
+      - name: Prove the regression fails on upstream for the expected tests
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE"
+          git apply --include="$TEST_FILE" "$GITHUB_WORKSPACE/audit-inputs/.contribution-audit/fixes.patch"
+          set +e
+          go test "./internal/$PACKAGE" -run "$TEST_PATTERN" -count=1 -timeout=2m -json > "$RUNNER_TEMP/evidence/red.jsonl" 2>&1
+          result=$?
+          set -e
+          test "$result" = 1
+          python3 - <<'PY'
+          import json, os, pathlib
+          lines = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'evidence/red.jsonl').read_text().splitlines()
+          failed = set()
+          for line in lines:
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get('Action') == 'fail' and event.get('Test'):
+                  failed.add(event['Test'])
+          required = set(os.environ['REQUIRED_FAILURES'].split(','))
+          if not required <= failed:
+              raise SystemExit(f'Expected behavioral failures {required}, got {failed}; a build error is not a reproduction')
+          print('Confirmed behavioral failures:', ', '.join(sorted(required)))
+          PY
+      - name: Apply only this fix and verify the reviewed source tree
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          git apply --include="$SOURCE_FILE" --include="$DOCS_FILE" "$GITHUB_WORKSPACE/audit-inputs/.contribution-audit/fixes.patch"
+          git add -- "$TEST_FILE" "$SOURCE_FILE"
+          if test -f "$DOCS_FILE"; then git add -- "$DOCS_FILE"; fi
+          git diff --cached --check
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git config user.name 'Divyam Talwar'
+          git config user.email '194859478+DivyamTalwar@users.noreply.github.com'
+          git commit -m "$COMMIT_MESSAGE"
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test -z "$(git status --porcelain)"
+          git show --stat HEAD > "$RUNNER_TEMP/evidence/commit.txt"
+          git diff "$BASE" HEAD > "$RUNNER_TEMP/evidence/fix.patch"
+      - name: Run the unmodified committed-HEAD gate before any branch push
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          scripts/gate.sh 2>&1 | tee "$RUNNER_TEMP/evidence/gate.txt"
+      - name: Full race suite, repeated regressions, formatting, dependency scan
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l "$SOURCE_FILE" "$TEST_FILE")"
+          go test -race ./... -count=1 -timeout=10m 2>&1 | tee "$RUNNER_TEMP/evidence/race.txt"
+          go test -race "./internal/$PACKAGE" -run "$TEST_PATTERN" -count=100 -timeout=5m 2>&1 | tee "$RUNNER_TEMP/evidence/repeated.txt"
+          govulncheck ./... 2>&1 | tee "$RUNNER_TEMP/evidence/govulncheck.txt"
+          test -z "$(git status --porcelain)"
+      - name: Start isolated PostgreSQL 18 integration fixture
+        run: |
+          set -euo pipefail
+          docker run -d --name contribution-pg -p 5432:5432 -e POSTGRES_PASSWORD=pw postgres:18 -c shared_preload_libraries=pg_stat_statements
+          for i in $(seq 1 60); do docker exec contribution-pg pg_isready -U postgres -h 127.0.0.1 -q && break; sleep 1; done
+          docker exec contribution-pg pg_isready -U postgres -h 127.0.0.1 -q
+          docker exec contribution-pg psql -U postgres -v ON_ERROR_STOP=1 -q \
+            -c "CREATE EXTENSION pg_stat_statements;" \
+            -c "CREATE TABLE people(id serial primary key, email text);" \
+            -c "INSERT INTO people(email) SELECT 'user'||g||'@example.com' FROM generate_series(1,2000) g;" \
+            -c "CREATE ROLE pgbot_ro LOGIN PASSWORD 'ro'; GRANT pg_monitor TO pgbot_ro; GRANT CONNECT ON DATABASE postgres TO pgbot_ro;"
+          docker inspect --format '{{.Image}}' contribution-pg > "$RUNNER_TEMP/evidence/postgres-image.txt"
+      - name: Run PostgreSQL 18 collector and CLI integration suites
+        working-directory: candidate
+        env:
+          PGBOT_TEST_DSN: postgres://pgbot_ro:ro@127.0.0.1:5432/postgres
+          PGBOT_TEST_SUPERUSER_DSN: postgres://postgres:pw@127.0.0.1:5432/postgres
+          PGBOT_TEST_LOAD: '1'
+        run: |
+          set -euo pipefail
+          docker exec contribution-pg psql -U postgres -q -c \
+            "DO \$\$ BEGIN FOR i IN 1..200000 LOOP INSERT INTO people(email) VALUES('l@example.com'); IF i%50=0 THEN COMMIT; END IF; END LOOP; END \$\$;" &
+          load_pid=$!
+          trap 'wait "$load_pid" || true' EXIT
+          go test ./internal/collect/ -run Integration -count=1 -timeout=10m -v 2>&1 | tee "$RUNNER_TEMP/evidence/pg18-collect.txt"
+          go test ./cmd/pgbot/ -run Integration -count=1 -timeout=10m -v 2>&1 | tee "$RUNNER_TEMP/evidence/pg18-cli.txt"
+      - name: Export and publish the exact tested commit to a new fork branch only
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'DivyamTalwar/pgbot'
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain)"
+          branch="fix/$SLUG-20260922"
+          git check-ref-format "refs/heads/$branch"
+          git remote set-url origin https://github.com/DivyamTalwar/pgbot.git
+          existing="$(git ls-remote --heads origin "refs/heads/$branch")"
+          test -z "$existing"
+          git bundle create "$RUNNER_TEMP/evidence/candidate.bundle" HEAD
+          git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin "HEAD:refs/heads/$branch"
+          { echo "branch=$branch"; echo "commit=$(git rev-parse HEAD)"; echo "tree=$EXPECTED_TREE"; echo "base=$BASE"; } | tee "$RUNNER_TEMP/evidence/published.txt"
+      - name: Preserve evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: contribution-${{ matrix.slug }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
+          if-no-files-found: error
