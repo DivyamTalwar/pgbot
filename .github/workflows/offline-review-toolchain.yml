@@ -1,0 +1,47 @@
+name: Fork-only offline review toolchain
+
+on:
+  push:
+    branches: [audit/pgbot-quality-20260922]
+    paths: [.github/workflows/offline-review-toolchain.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.repository == 'DivyamTalwar/pgbot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a1e6561e366455756c45a16a46647f882b3b6a1c
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Collect the pinned public tools and project modules only
+        run: |
+          set -euo pipefail
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          kit="$RUNNER_TEMP/pgbot-offline"
+          mkdir -p "$kit/go" "$kit/bin" "$kit/modcache"
+          cp -a "$(go env GOROOT)/." "$kit/go/"
+          cp "$(go env GOPATH)/bin/golangci-lint" "$kit/bin/"
+          GOMODCACHE="$kit/modcache" go mod download
+          GOMODCACHE="$kit/modcache" go mod verify
+          { git rev-parse HEAD; go version; golangci-lint version; } > "$kit/VERSIONS.txt"
+          tar -C "$kit" -czf "$RUNNER_TEMP/pgbot-offline.tar.gz" .
+          cd "$RUNNER_TEMP"
+          sha256sum pgbot-offline.tar.gz > pgbot-offline.sha256
+      - name: Export reproducible offline review inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pgbot-offline-toolchain
+          path: |
+            ${{ runner.temp }}/pgbot-offline.tar.gz
+            ${{ runner.temp }}/pgbot-offline.sha256
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
