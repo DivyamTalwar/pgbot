@@ -1,0 +1,421 @@
+diff --git a/internal/mcp/mcp.go b/internal/mcp/mcp.go
+index 7ad8075..69cb6be 100644
+--- a/internal/mcp/mcp.go
++++ b/internal/mcp/mcp.go
+@@ -88,7 +88,8 @@ const defaultProtocol = "2024-11-05"
+ 
+ // Serve runs the read-dispatch-write loop until stdin closes. Messages are one
+ // JSON object per line; responses go to out. Nothing but protocol goes to out —
+-// callers must log to stderr.
++// callers must log to stderr. A failed response write ends the session so no
++// further tools are dispatched after the output transport is lost.
+ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
+ 	r := bufio.NewReader(in)
+ 	w := bufio.NewWriter(out)
+@@ -97,7 +98,9 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
+ 		line, err := r.ReadBytes('\n')
+ 		if len(bytes.TrimSpace(line)) > 0 {
+ 			s.dispatch(ctx, line, w, &proto)
+-			_ = w.Flush()
++			if err := w.Flush(); err != nil {
++				return err
++			}
+ 		}
+ 		if err != nil {
+ 			if err == io.EOF {
+diff --git a/internal/mcp/transport_test.go b/internal/mcp/transport_test.go
+new file mode 100644
+index 0000000..bfcadbf
+--- /dev/null
++++ b/internal/mcp/transport_test.go
+@@ -0,0 +1,73 @@
++package mcp
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++)
++
++type transportWriterFunc func([]byte) (int, error)
++
++func (f transportWriterFunc) Write(p []byte) (int, error) { return f(p) }
++
++func TestServe_returnsWriteErrorAndStopsDispatch(t *testing.T) {
++	brokenPipe := errors.New("output pipe closed")
++	for _, tc := range []struct {
++		name    string
++		payload string
++		writer  io.Writer
++		wantErr error
++	}{
++		{
++			name:    "buffered response",
++			payload: "ok",
++			writer:  transportWriterFunc(func([]byte) (int, error) { return 0, brokenPipe }),
++			wantErr: brokenPipe,
++		},
++		{
++			name:    "response larger than buffer",
++			payload: strings.Repeat("x", 8192),
++			writer:  transportWriterFunc(func([]byte) (int, error) { return 0, brokenPipe }),
++			wantErr: brokenPipe,
++		},
++		{
++			name:    "short write",
++			payload: "ok",
++			writer:  transportWriterFunc(func(p []byte) (int, error) { return len(p) / 2, nil }),
++			wantErr: io.ErrShortWrite,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			srv := &Server{Tools: []Tool{{
++				Name: "inspect",
++				Handler: func(context.Context, json.RawMessage) (string, error) {
++					calls++
++					return tc.payload, nil
++				},
++			}}}
++			in := strings.NewReader(
++				`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inspect"}}` + "\n" +
++					`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inspect"}}` + "\n")
++			err := srv.Serve(context.Background(), in, tc.writer)
++			if !errors.Is(err, tc.wantErr) {
++				t.Errorf("Serve error = %v, want %v", err, tc.wantErr)
++			}
++			if calls != 1 {
++				t.Errorf("dispatched %d tools after output failed; want only the first tool", calls)
++			}
++		})
++	}
++}
++
++func TestServe_finalResponseWriteErrorWinsOverEOF(t *testing.T) {
++	wantErr := errors.New("output pipe closed")
++	out := transportWriterFunc(func([]byte) (int, error) { return 0, wantErr })
++	in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
++	if err := testServer().Serve(context.Background(), in, out); !errors.Is(err, wantErr) {
++		t.Fatalf("Serve error = %v, want output failure rather than successful EOF", err)
++	}
++}
+diff --git a/internal/conn/sshtunnel.go b/internal/conn/sshtunnel.go
+index 99773b5..98cfbcb 100644
+--- a/internal/conn/sshtunnel.go
++++ b/internal/conn/sshtunnel.go
+@@ -198,7 +198,23 @@ func dialSSH(ctx context.Context, spec string) (*ssh.Client, error) {
+ 	if dl, ok := ctx.Deadline(); ok {
+ 		_ = rawConn.SetDeadline(dl)
+ 	}
++	// NewClientConn has no context parameter. Close the TCP connection when the
++	// caller cancels, including cancellation before (or without) a deadline.
++	// Stop and join the callback before publishing a successful shared client:
++	// cancelling this request later must not close other requests' channels.
++	cancelDone := make(chan struct{})
++	stopCancel := context.AfterFunc(ctx, func() {
++		_ = rawConn.Close()
++		close(cancelDone)
++	})
+ 	sc, chans, reqs, err := ssh.NewClientConn(rawConn, h.addr, cfg)
++	if !stopCancel() {
++		<-cancelDone
++		if sc != nil {
++			_ = sc.Close()
++		}
++		return nil, fmt.Errorf("handshake with %s: %w", h.addr, ctx.Err())
++	}
+ 	if err != nil {
+ 		_ = rawConn.Close()
+ 		return nil, fmt.Errorf("handshake with %s: %w", h.addr, err)
+diff --git a/internal/conn/sshtunnel_cancel_test.go b/internal/conn/sshtunnel_cancel_test.go
+new file mode 100644
+index 0000000..abcb3e9
+--- /dev/null
++++ b/internal/conn/sshtunnel_cancel_test.go
+@@ -0,0 +1,122 @@
++package conn
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"net"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestDialSSH_cancelStalledHandshake(t *testing.T) {
++	for _, withDeadline := range []bool{false, true} {
++		name := "without deadline"
++		if withDeadline {
++			name = "before deadline"
++		}
++		t.Run(name, func(t *testing.T) {
++			fixture := setupTunnelFixture(t)
++			ln, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(func() { _ = ln.Close() })
++
++			// Keep private credentials and host-key policy, but point the alias at
++			// a peer that accepts TCP and never sends its SSH identification.
++			stalled := *fixture
++			stalled.srv = &testSSHServer{addr: ln.Addr().String()}
++			stalled.writeConfig(t, "  StrictHostKeyChecking yes\n  UserKnownHostsFile "+fixture.knownPath+"\n")
++
++			accepted := make(chan net.Conn, 1)
++			go func() {
++				if nc, err := ln.Accept(); err == nil {
++					accepted <- nc
++				}
++			}()
++			var ctx context.Context
++			var cancel context.CancelFunc
++			if withDeadline {
++				ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
++			} else {
++				ctx, cancel = context.WithCancel(context.Background())
++			}
++			defer cancel()
++			done := make(chan error, 1)
++			go func() {
++				client, err := dialSSH(ctx, fixture.alias)
++				if client != nil {
++					_ = client.Close()
++					if err == nil {
++						err = errors.New("handshake unexpectedly succeeded without a server identification")
++					}
++				}
++				done <- err
++			}()
++
++			var peer net.Conn
++			select {
++			case peer = <-accepted:
++			case err := <-done:
++				t.Fatalf("dial ended before the handshake started: %v", err)
++			case <-time.After(5 * time.Second):
++				t.Fatal("TCP peer was not reached")
++			}
++			defer peer.Close()
++			if err := peer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
++				t.Fatal(err)
++			}
++			banner, err := bufio.NewReader(peer).ReadString('\n')
++			if err != nil || !strings.HasPrefix(banner, "SSH-") {
++				t.Fatalf("client did not start its SSH handshake: banner=%q err=%v", banner, err)
++			}
++			cancel()
++			select {
++			case err := <-done:
++				if !errors.Is(err, context.Canceled) {
++					t.Fatalf("dial error = %v, want context.Canceled", err)
++				}
++			case <-time.After(time.Second):
++				// Unblock and join the old implementation before restoring global
++				// ssh_config state. A regression must fail, not leak a goroutine.
++				_ = peer.Close()
++				select {
++				case <-done:
++				case <-time.After(5 * time.Second):
++					t.Fatal("dial did not exit even after the peer was closed")
++				}
++				t.Fatal("cancelled SSH handshake remained blocked waiting for the peer")
++			}
++		})
++	}
++}
++
++func TestSSHTunnel_completedHandshakeOutlivesDialContext(t *testing.T) {
++	srv := setupTunnelFixture(t).srv
++	echo := startEcho(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	dial := sshDialFunc()
++	first, err := dial(ctx, "tcp", echo)
++	if err != nil {
++		t.Fatal(err)
++	}
++	roundTrip(t, first, "first request")
++	client := currentTunnelClient()
++	cancel()
++
++	// An MCP request's cancellation must not close the established singleton
++	// used by the next request or by another database's pool.
++	nextCtx, nextCancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer nextCancel()
++	second, err := dial(nextCtx, "tcp", echo)
++	if err != nil {
++		t.Fatalf("established tunnel was tied to the first request: %v", err)
++	}
++	roundTrip(t, second, "next request")
++	if currentTunnelClient() != client || srv.connCount() != 1 {
++		t.Fatal("cancelling a completed dial replaced its healthy shared tunnel")
++	}
++}
+diff --git a/docs/findings/replica_lag_time.md b/docs/findings/replica_lag_time.md
+index 6054a3f..7521896 100644
+--- a/docs/findings/replica_lag_time.md
++++ b/docs/findings/replica_lag_time.md
+@@ -19,7 +19,9 @@ related: [sync_rep_degraded, recovery_conflicts]
+ At least one standby's `replay_lag` in `pg_stat_replication` is **≥ 60 seconds**
+ (`warn`), or **≥ 300 seconds** (`critical`). The warn threshold is the
+ `replica_lag_warn_seconds` tunable (default `replicaLagWarnSec = 60`); the critical
+-threshold is fixed at `replicaLagCritSec = 300`. The check is **gated on WAL
++threshold is fixed at `replicaLagCritSec = 300`. Raising the warning threshold
++above 300 seconds does not suppress critical lag at or above 300 seconds. The
++check is **gated on WAL
+ actually flowing** — pgbot only evaluates it when its own WAL sampling shows bytes
+ being written on the primary (`WAL.BytesPerSec > 0`). That gate matters:
+ `replay_lag` on an idle primary is stale and reads a reassuring "zero" even when a
+@@ -90,8 +92,9 @@ expires = "2027-01-01"
+ ```
+ 
+ If some standbys are failover targets and others aren't, prefer raising
+-`replica_lag_warn_seconds` to a level that only trips on the ones you care about,
+-rather than muting the finding outright.
++`replica_lag_warn_seconds` to reduce subcritical warnings rather than muting the
++finding outright. This remains a cluster-wide warning threshold, not a per-standby
++filter: the fixed 300-second critical threshold still applies to every standby.
+ 
+ ## What pgbot cannot see
+ 
+diff --git a/internal/findings/findings.go b/internal/findings/findings.go
+index f8e7ee9..5c1ee97 100644
+--- a/internal/findings/findings.go
++++ b/internal/findings/findings.go
+@@ -145,8 +145,8 @@ func KnownID(id string) bool { return knownIDs[id] }
+ // Tunables are the thresholds a user config may override ([thresholds] in
+ // .pgbot.toml). Only these keys are wired — everything else stays a compiled-in
+ // const (an unknown key in a config is a loud warning, not a silent no-op).
+-// Applied BEFORE the finding is produced, so a raised threshold means the
+-// finding is never generated at all (B2-2 precedence rule 1).
++// Applied BEFORE the finding is produced (B2-2 precedence rule 1). Raising a
++// warning threshold does not override a separate compiled-in critical threshold.
+ type Tunables struct {
+ 	UnusedIndexMinBytes int64   // unused_index_min_size_mb × 1MiB
+ 	DeadRatioWarn       float64 // dead_ratio_warn
+@@ -1433,7 +1433,9 @@ func failoverReadiness(c *model.Context, add func(model.Finding), tun Tunables)
+ 		var ev []string
+ 		worst, crit := 0.0, false
+ 		for _, r := range c.Replication.Replicas {
+-			if r.ReplayLagSec == nil || *r.ReplayLagSec < tun.ReplicaLagWarnSec {
++			// The configurable warning gate must not suppress the fixed critical
++			// boundary when a user raises it above replicaLagCritSec.
++			if r.ReplayLagSec == nil || (*r.ReplayLagSec < tun.ReplicaLagWarnSec && *r.ReplayLagSec < replicaLagCritSec) {
+ 				continue
+ 			}
+ 			if *r.ReplayLagSec > worst {
+diff --git a/internal/findings/replica_lag_threshold_test.go b/internal/findings/replica_lag_threshold_test.go
+new file mode 100644
+index 0000000..27f3542
+--- /dev/null
++++ b/internal/findings/replica_lag_threshold_test.go
+@@ -0,0 +1,102 @@
++package findings
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/pgrundev/pgbot/internal/model"
++)
++
++func TestReplicaLagTime_warningThresholdCannotHideCritical(t *testing.T) {
++	cases := []struct {
++		name     string
++		warn     float64
++		lag      float64
++		severity string
++	}{
++		{"below default warning", 60, 59, ""},
++		{"at default warning", 60, 60, model.SeverityWarn},
++		{"below critical", 60, 299, model.SeverityWarn},
++		{"at critical", 60, 300, model.SeverityCritical},
++		{"lower warning", 30, 30, model.SeverityWarn},
++		{"below raised warning", 180, 179, ""},
++		{"at raised warning", 180, 180, model.SeverityWarn},
++		{"warning equals critical", 300, 300, model.SeverityCritical},
++		{"high warning suppresses only subcritical lag", 600, 299, ""},
++		{"high warning cannot hide critical boundary", 600, 300, model.SeverityCritical},
++		{"high warning cannot hide critical lag", 600, 450, model.SeverityCritical},
++		{"lag reaches high warning", 600, 600, model.SeverityCritical},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			flow := 1000.0
++			c := &model.Context{
++				WAL: &model.WAL{BytesPerSec: &flow},
++				Replication: &model.Replication{Replicas: []model.ReplicaRow{
++					{AppName: "standby", ReplayLagSec: &tc.lag},
++				}},
++			}
++			tun := DefaultTunables()
++			tun.ReplicaLagWarnSec = tc.warn
++			f := has(ComputeWithTunables(c, tun), "replica_lag_time")
++			if tc.severity == "" {
++				if f != nil {
++					t.Fatalf("unexpected lag finding: %+v", f)
++				}
++				return
++			}
++			if f == nil || f.Severity != tc.severity {
++				t.Fatalf("warning threshold %g, lag %g: got %+v, want %s", tc.warn, tc.lag, f, tc.severity)
++			}
++		})
++	}
++}
++
++func TestReplicaLagTime_highWarningPreservesMissingAndIdleGuards(t *testing.T) {
++	lag, idle, flowing := 450.0, 0.0, 1000.0
++	for _, wal := range []*model.WAL{nil, {}, {BytesPerSec: &idle}} {
++		c := &model.Context{
++			WAL: wal,
++			Replication: &model.Replication{Replicas: []model.ReplicaRow{
++				{AppName: "standby", ReplayLagSec: &lag},
++			}},
++		}
++		tun := DefaultTunables()
++		tun.ReplicaLagWarnSec = 600
++		if f := has(ComputeWithTunables(c, tun), "replica_lag_time"); f != nil {
++			t.Errorf("unmeasured or idle WAL must still suppress lag: %+v", f)
++		}
++	}
++	c := &model.Context{
++		WAL: &model.WAL{BytesPerSec: &flowing},
++		Replication: &model.Replication{Replicas: []model.ReplicaRow{
++			{AppName: "no-lag-measurement"},
++		}},
++	}
++	tun := DefaultTunables()
++	tun.ReplicaLagWarnSec = 600
++	if f := has(ComputeWithTunables(c, tun), "replica_lag_time"); f != nil {
++		t.Errorf("unknown replay lag must not produce a finding: %+v", f)
++	}
++}
++
++func TestReplicaLagTime_highWarningReportsWorstCriticalReplica(t *testing.T) {
++	flow, low, high := 1000.0, 300.0, 450.0
++	c := &model.Context{
++		WAL: &model.WAL{BytesPerSec: &flow},
++		Replication: &model.Replication{Replicas: []model.ReplicaRow{
++			{AppName: "unknown"},
++			{AppName: "first", ReplayLagSec: &low},
++			{AppName: "worst", ReplayLagSec: &high},
++		}},
++	}
++	tun := DefaultTunables()
++	tun.ReplicaLagWarnSec = 600
++	f := has(ComputeWithTunables(c, tun), "replica_lag_time")
++	if f == nil || f.Severity != model.SeverityCritical {
++		t.Fatalf("critical lag was hidden by the warning threshold: %+v", f)
++	}
++	if !strings.Contains(f.Title, "450s") || len(f.Evidence) != 2 {
++		t.Errorf("must report worst measured lag and both critical replicas: %+v", f)
++	}
++}
