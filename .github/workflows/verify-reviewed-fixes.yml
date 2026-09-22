@@ -1,0 +1,123 @@
+name: Verify reviewed contribution commits
+
+on:
+  push:
+    branches: [ci/verify-reviewed-fixes-20260922]
+    paths: [.github/workflows/verify-reviewed-fixes.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'DivyamTalwar/pgbot'
+    name: PR ${{ matrix.pr }} pinned commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - pr: 63
+            sha: c1325b1de0b0f90f72426788ac927f8c5a450581
+          - pr: 64
+            sha: 0e9cecb8cafe087cdc5efc661c91ee067804dccb
+          - pr: 65
+            sha: d49754f720c481cc3d6d10b3a1f640e4dfe55f95
+          - pr: 66
+            sha: 6a4973ee940b4a945e194d9ce12ec393f6229bc1
+          - pr: 69
+            sha: bbe15f07ce2e2302282a3cc89bdb20aacf82e8dc
+          - pr: 70
+            sha: aea46b69d19026cc87f84617c2c2a8216c4465d2
+          - pr: 71
+            sha: 06bfbfdf2bc7dd4738774d5c6e9224fcc1aed6b4
+          - pr: 73
+            sha: 2568c50be4f9e2968743d2816d82f7d501e24bdd
+          - pr: 75
+            sha: cb4a50178320862928938da8fac3ca27786821f0
+          - pr: 77
+            sha: 69248627df377e8808ea43af495d20b8bbfc3464
+          - pr: 79
+            sha: b81cbb1846cda27041fc66aaff6fcd32359d4ea9
+          - pr: 81
+            sha: d59be1de91ba16551828a87e04ee4ab1695375af
+          - pr: 83
+            sha: 6e17fb1695b1f8f2feef42b703c31ce3bf854df1
+          - pr: 85
+            sha: 32dd69c0b3bdb3974c7a857bdeaefb2ea3a3cc77
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Record exact source revision
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          mkdir -p "$RUNNER_TEMP/proof"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/proof/commit.txt"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Install upstream-pinned linter
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      - name: Committed-HEAD gate and full race suite
+        run: |
+          set -euo pipefail
+          scripts/gate.sh 2>&1 | tee "$RUNNER_TEMP/proof/gate.txt"
+          go test -race ./... 2>&1 | tee "$RUNNER_TEMP/proof/race.txt"
+      - name: Disposable PostgreSQL 18 fixture
+        run: |
+          set -euo pipefail
+          docker run -d --name pgbot-review-pg -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=fixture_pw             postgres:18 -c shared_preload_libraries=pg_stat_statements
+          ready=false
+          for i in $(seq 1 60); do
+            if docker exec pgbot-review-pg pg_isready -U postgres -h 127.0.0.1 -q; then ready=true; break; fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker exec pgbot-review-pg psql -v ON_ERROR_STOP=1 -U postgres -q             -c "CREATE EXTENSION pg_stat_statements;"             -c "CREATE TABLE people(id serial primary key, email text);"             -c "INSERT INTO people(email) SELECT 'user'||g||'@example.com' FROM generate_series(1,2000) g;"             -c "CREATE ROLE pgbot_ro LOGIN PASSWORD 'fixture_ro'; GRANT pg_monitor TO pgbot_ro; GRANT CONNECT ON DATABASE postgres TO pgbot_ro;"
+      - name: Real PostgreSQL collector and CLI integration
+        env:
+          PGBOT_TEST_DSN: postgres://pgbot_ro:fixture_ro@127.0.0.1:5432/postgres
+          PGBOT_TEST_SUPERUSER_DSN: postgres://postgres:fixture_pw@127.0.0.1:5432/postgres
+          PGBOT_TEST_LOAD: "1"
+        run: |
+          set -euo pipefail
+          docker exec pgbot-review-pg psql -v ON_ERROR_STOP=1 -U postgres -q -c             "DO \$\$ BEGIN FOR i IN 1..200000 LOOP INSERT INTO people(email) VALUES('l@example.com'); IF i%50=0 THEN COMMIT; END IF; END LOOP; END \$\$;" &
+          load_pid=$!
+          trap 'kill "$load_pid" 2>/dev/null || true' EXIT
+          go test ./internal/collect/ -run Integration -v 2>&1 | tee "$RUNNER_TEMP/proof/pg18-collect.txt"
+          go test ./cmd/pgbot/ -run Integration -v 2>&1 | tee "$RUNNER_TEMP/proof/pg18-cli.txt"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 20
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.x
+      - name: Wrapper and local package installation
+        run: |
+          set -euo pipefail
+          node --test npm/test/*.test.mjs 2>&1 | tee "$RUNNER_TEMP/proof/wrapper.txt"
+          bash npm/test/pack-smoke.sh npm bun 2>&1 | tee "$RUNNER_TEMP/proof/pack.txt"
+      - name: Dependency vulnerability check
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./... 2>&1 | tee "$RUNNER_TEMP/proof/vulnerability-check.txt"
+      - name: Preserve exact-commit verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reviewed-pr-${{ matrix.pr }}-evidence
+          path: ${{ runner.temp }}/proof/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Remove owned test fixture
+        if: always()
+        run: docker rm -f pgbot-review-pg || true
